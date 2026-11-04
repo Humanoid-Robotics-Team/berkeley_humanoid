@@ -1,0 +1,6 @@
+__pycache__/
+*.log
+*.mp4
+mujoco_playground/
+runs/*/checkpoints/
+runs/*/ppo_*/

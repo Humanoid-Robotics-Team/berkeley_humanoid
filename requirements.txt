@@ -1,0 +1,8 @@
+gymnasium==1.4.0
+ImageIO==2.38.1
+imageio-ffmpeg==0.7.0
+matplotlib==3.11.2
+mujoco==3.17.0
+numpy==2.4.6
+stable_baselines3==2.9.2
+tensorboard==2.21.0
