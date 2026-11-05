@@ -4,9 +4,12 @@
     python train.py --steps 5e6 --envs 6
     python train.py --resume runs/bh_ppo/checkpoints/bh_5000000_steps.zip
     python train.py --terrain --scan --init runs/bh_terrain/final_model.zip --name bh_scan
+    python train.py --terrain --scan --init runs/bh_scan/checkpoints/bh_13999776_steps.zip --name bh_scan2 \
+        --lr 1e-4 --ent-coef 0.001 --target-kl 0.02 --std 0.4
 """
 
 import argparse
+import math
 import os
 import pickle
 
@@ -81,6 +84,10 @@ def main():
     p.add_argument("--resume", default=None, help="checkpoint .zip to continue (same run, same step count)")
     p.add_argument("--init", default=None, help="model .zip to start a new run from (e.g. flat -> terrain)")
     p.add_argument("--scan", action="store_true", help="add a terrain height scan to the policy's inputs")
+    p.add_argument("--lr", type=float, default=None, help="override the learning rate")
+    p.add_argument("--ent-coef", type=float, default=None, help="override the entropy bonus")
+    p.add_argument("--target-kl", type=float, default=None, help="stop an update early above this KL")
+    p.add_argument("--std", type=float, default=None, help="reset the exploration noise to this std")
     args = p.parse_args()
 
     run_dir = os.path.join("runs", args.name)
@@ -117,6 +124,17 @@ def main():
         )
         if widen:
             widen_from_blind(model, venv, args.init)
+
+    # For fine-tuning: an unstable policy can't place its feet precisely enough for stairs.
+    if args.lr is not None:
+        model.learning_rate = args.lr
+        model._setup_lr_schedule()
+    if args.ent_coef is not None:
+        model.ent_coef = args.ent_coef
+    if args.target_kl is not None:
+        model.target_kl = args.target_kl
+    if args.std is not None:
+        model.policy.log_std.data.fill_(math.log(args.std))
 
     callbacks = [
         CheckpointCallback(save_freq=max(500_000 // args.envs, 1), save_path=ckpt_dir,

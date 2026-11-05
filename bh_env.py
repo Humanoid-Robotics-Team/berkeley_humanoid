@@ -5,6 +5,8 @@ A NumPy port of MuJoCo Playground's `BerkeleyHumanoidJoystickFlatTerrain`
 so it trains with Stable-Baselines3 on a laptop instead of JAX/MJX on a GPU.
 """
 
+import functools
+import hashlib
 import os
 
 import gymnasium as gym
@@ -36,6 +38,9 @@ REWARD_SCALES = dict(
     pose=-1.0,
 )
 TRACKING_SIGMA = 0.5
+# Tighter on terrain: at 0.5, standing still in front of stairs still earns 60% of the
+# tracking reward at 0.5 m/s, so stalling beats risking a fall.
+TRACKING_SIGMA_TERRAIN = 0.25
 MAX_FOOT_HEIGHT = 0.1
 ACTION_SCALE = 0.5
 CTRL_DT = 0.02
@@ -58,6 +63,28 @@ def get_rz(phi, swing_height):
         return y0 + (y1 - y0) * (x**3 + 3 * (x**2 * (1 - x)))
     x = (phi + np.pi) / (2 * np.pi)
     return np.where(x <= 0.5, bezier(0, swing_height, 2 * x), bezier(swing_height, 0, 2 * x - 1))
+
+
+@functools.lru_cache(maxsize=None)
+def _load_model(xml_path, terrain):
+    """One read-only model per process: each copy is ~100 MB, and only MjData changes per env."""
+    course = None
+    if terrain:
+        from terrain import Terrain
+        course = Terrain()
+        xml_path = course.scene_xml(os.path.dirname(xml_path))
+    # Compiling the XML leaves ~500 MB of heap behind in each process, loading a binary doesn't.
+    with open(xml_path, "rb") as f:
+        tag = hashlib.sha1(f.read() + mujoco.__version__.encode()).hexdigest()[:12]
+    mjb = f"{xml_path}.{tag}.mjb"
+    if not os.path.exists(mjb):
+        tmp = f"{mjb}.{os.getpid()}.tmp"
+        mujoco.mj_saveModel(mujoco.MjModel.from_xml_path(xml_path), tmp)
+        os.replace(tmp, mjb)  # several worker processes may get here at once
+    model = mujoco.MjModel.from_binary_path(mjb)
+    if course is not None:
+        course.apply(model)
+    return model, course
 
 
 class BerkeleyHumanoidEnv(gym.Env):
@@ -84,14 +111,7 @@ class BerkeleyHumanoidEnv(gym.Env):
         # terrain=True swaps the flat floor for terrain.py's course of rough ground,
         # slopes and stairs, with a per-env difficulty curriculum. spawn_tile=(type, level)
         # pins the spawn tile and turns the curriculum off (used by play.py).
-        self.terrain = None
-        if terrain:
-            from terrain import Terrain
-            self.terrain = Terrain()
-            xml_path = self.terrain.scene_xml(os.path.dirname(xml_path))
-        self.model = mujoco.MjModel.from_xml_path(xml_path)
-        if self.terrain is not None:
-            self.terrain.apply(self.model)
+        self.model, self.terrain = _load_model(xml_path, terrain)
         self.data = mujoco.MjData(self.model)
         self.spawn_tile = spawn_tile
         self.random_init = random_init  # False: start from the home pose (eval / viewing)
@@ -99,6 +119,7 @@ class BerkeleyHumanoidEnv(gym.Env):
         self.levels = np.zeros(4, dtype=int)  # curriculum level per terrain type
         self.type_idx = 0
         self.swing_height = swing_height or (0.12 if terrain else MAX_FOOT_HEIGHT)
+        self.tracking_sigma = TRACKING_SIGMA_TERRAIN if terrain else TRACKING_SIGMA
         self.n_substeps = int(round(CTRL_DT / self.model.opt.timestep))
         self.dt = CTRL_DT
 
@@ -170,7 +191,8 @@ class BerkeleyHumanoidEnv(gym.Env):
         return np.clip(d.qpos[2] - self._ground(x, y) - 0.5, -1.0, 1.0)
 
     def _update_curriculum(self):
-        """Isaac Lab-style: harder tile after walking off the tile, easier after an early fall."""
+        """Isaac Lab-style: harder tile after walking off the tile, easier after an early fall
+        or after covering less than half the commanded distance."""
         from terrain import N_LEVELS, TILE
         if self.spawn_tile is not None or not hasattr(self, "spawn_xy"):
             return
@@ -178,7 +200,7 @@ class BerkeleyHumanoidEnv(gym.Env):
         level = self.levels[self.type_idx]
         if dist > TILE / 2:
             level = level + 1 if level < N_LEVELS - 1 else int(self.np_random.integers(N_LEVELS))
-        elif self.fell and dist < TILE / 4:
+        elif (self.fell and dist < TILE / 4) or dist < 0.5 * self.cmd_path:
             level = max(level - 1, 0)
         self.levels[self.type_idx] = level
 
@@ -230,6 +252,7 @@ class BerkeleyHumanoidEnv(gym.Env):
 
         self.step_count = 0      # total steps this episode (for truncation)
         self.cmd_step = 0        # steps since last command resample
+        self.cmd_path = 0.0      # distance the commands asked for so far
         self.command = self.sample_command()
         self.last_act = np.zeros(self.model.nu)
         self.feet_air_time = np.zeros(2)
@@ -273,6 +296,7 @@ class BerkeleyHumanoidEnv(gym.Env):
         # Advance the clock / histories.
         self.step_count += 1
         self.cmd_step += 1
+        self.cmd_path += np.linalg.norm(self.command[:2]) * self.dt
         self.phase = np.fmod(self.phase + self.phase_dt + np.pi, 2 * np.pi) - np.pi
         self.last_act = action
         if self.cmd_step > 500:
@@ -330,8 +354,8 @@ class BerkeleyHumanoidEnv(gym.Env):
         dq = qpos - self.default_pose
 
         return dict(
-            tracking_lin_vel=np.exp(-sq(cmd[:2] - local_vel[:2]) / TRACKING_SIGMA),
-            tracking_ang_vel=np.exp(-((cmd[2] - gyro[2]) ** 2) / TRACKING_SIGMA),
+            tracking_lin_vel=np.exp(-sq(cmd[:2] - local_vel[:2]) / self.tracking_sigma),
+            tracking_ang_vel=np.exp(-((cmd[2] - gyro[2]) ** 2) / self.tracking_sigma),
             ang_vel_xy=sq(self._sensor("global_angvel")[:2]),
             orientation=sq(self._sensor("upvector")[:2]),
             torques=np.abs(d.actuator_force).sum(),

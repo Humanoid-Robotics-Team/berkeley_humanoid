@@ -13,8 +13,13 @@ rough ground and stairs, using CPU MuJoCo and Stable-Baselines3 PPO. No GPU or W
 | `play.py` | Watch a policy in the MuJoCo viewer, or record an `.mp4` |
 | `eval_terrain.py` | Score a policy on every terrain type and level |
 | `make_article_images.py` | Render the write-up's images into `article_images/` |
+| `flip_model.py` | The robot set up for flipping: full-body collisions and the real motors' torque-speed limits |
+| `flip_search.py` | Finds an open-loop backflip the motors can make, saved as `flip_reference.npz` |
+| `flip_env.py`, `train_flip.py` | Backflip env that follows that motion, and its PPO training |
+| `play_flip.py` | Watch, record or score a backflip policy |
 
-`runs/bh_ppo` (flat ground) and `runs/bh_terrain` (blind terrain policy) hold trained models.
+`runs/bh_ppo` (flat ground), `runs/bh_terrain` (blind terrain policy), `runs/bh_scan2` (terrain policy
+with a height scan, the best one on terrain) and `runs/bh_flip_best` (backflip) hold trained models.
 
 ## Setup
 
@@ -78,27 +83,97 @@ to its inputs. `--init` with a blind model starts from that model with the new i
 ```bash
 python train.py --terrain --init runs/bh_ppo/final_model.zip --name bh_terrain
 python train.py --terrain --scan --init runs/bh_terrain/final_model.zip --name bh_scan
-python eval_terrain.py --model runs/bh_scan/final_model.zip
-python play.py --model runs/bh_terrain/final_model.zip --tile stairs_up --level 1
+python train.py --terrain --scan --init runs/bh_scan/checkpoints/bh_13999776_steps.zip --name bh_scan2 --lr 1e-4 --ent-coef 0.001 --target-kl 0.02 --std 0.4 --steps 15e6
+python eval_terrain.py --model runs/bh_scan2/final_model.zip
+python play.py --model runs/bh_scan2/final_model.zip --tile stairs_up --level 1
 ```
+
+The last training step is a fine-tune. In the `bh_scan` run the exploration noise kept growing
+(std 0.44 to 0.62) and the curriculum stopped improving after about 2M steps, so `bh_scan2` starts
+from its 14M checkpoint with a lower learning rate, entropy bonus and noise. On terrain the speed
+reward is now tighter (`TRACKING_SIGMA_TERRAIN`) and an env also drops a level if it covers less than
+half the commanded distance, so stalling doesn't pay.
+
+Training needs about 3.5 GB of free memory with the default 4 workers. On Windows, running out of
+commit (RAM + pagefile) crashes it with `MemoryError`; use `--workers 2` or close other apps.
 
 ## Results
 
-Runs out of 20 that finished 8 s at 0.5 m/s without falling, from a standing start, for the
-blind policy after 20M terrain steps:
+Runs out of 20 that walked: no fall in 8 s at a 0.5 m/s command from a standing start, covering
+at least half the commanded distance (`eval_terrain.py --episodes 20`).
+
+Height-scan policy, `runs/bh_scan2`:
 
 | Terrain | Level 0 | Level 1 | Level 2 | Level 3 | Level 4 |
 |---|---|---|---|---|---|
-| Slope (3°, 6°, 10°, 13°, 17°) | 20 | 20 | 19 | 20 | 16 |
-| Rough (±1 to ±5 cm) | 20 | 20 | 17 | 8 | 4 |
-| Stairs down (2 to 10 cm) | 20 | 19 | 13 | 4 | 1 |
-| Stairs up (2 to 10 cm) | 20 | 14 | 0 | 0 | 0 |
+| Slope (3°, 6°, 10°, 13°, 17°) | 20 | 20 | 20 | 4 | 17 |
+| Rough (±1 to ±5 cm) | 20 | 20 | 20 | 11 | 9 |
+| Stairs down (2 to 10 cm) | 20 | 20 | 18 | 11 | 3 |
+| Stairs up (2 to 10 cm) | 20 | 20 | 10 | 2 | 0 |
 
-The height-scan run hasn't finished, so no scan model is included yet. An early checkpoint at 8.5M
-steps scored 20/20 on 4 cm stairs up, 9/20 on 6 cm stairs up, 17/20 on 6 cm stairs down and
-12/20 on 8 cm stairs down.
+Blind policy, `runs/bh_terrain`, after 20M terrain steps:
+
+| Terrain | Level 0 | Level 1 | Level 2 | Level 3 | Level 4 |
+|---|---|---|---|---|---|
+| Slope (3°, 6°, 10°, 13°, 17°) | 20 | 19 | 19 | 0 | 16 |
+| Rough (±1 to ±5 cm) | 20 | 20 | 16 | 8 | 3 |
+| Stairs down (2 to 10 cm) | 20 | 19 | 13 | 4 | 1 |
+| Stairs up (2 to 10 cm) | 20 | 12 | 0 | 0 | 0 |
+
+Slope tiles alternate between hill and valley. Odd levels are valleys, so level 3 means walking
+uphill at 13°, where the robot stays upright but stalls (20/20 stayed up, 4 walked). Level 4 is a hill,
+so its score only covers walking down 17°. Stairs up above 6 cm is still out of reach.
+
+## Backflip
+
+From a crouch on flat ground, the robot jumps, rotates backward, lands on its feet and stays up.
+
+```bash
+python play_flip.py                                   # watch it, half speed
+python play_flip.py --record backflip.mp4 --tries 2
+python play_flip.py --score 40 --perturb 1            # flips landed under small disturbances
+```
+
+To train it again:
+
+```bash
+python flip_search.py                # about 10 minutes; flip_reference.npz is already included
+python train_flip.py --steps 15e6
+```
+
+`flip_search.py` looks for joint targets that make a whole flip, with no feedback. The result lands
+and gets back up, then tips over slowly. PPO follows that motion, then has to balance by itself once
+it ends. Episodes also start part way along the motion, so landing gets practised from the start.
+Without this motion to follow, the policy settled for jumping and falling on its back.
+
+More training didn't keep helping. Results under disturbance peaked between 5M and 9.5M steps and
+then fell, and the model from the end of the 15M run failed even without disturbance. So scoring
+every checkpoint picked `runs/bh_flip_best`, the 6.5M one, and the results below use different random
+runs from the ones it was picked on.
+
+| Disturbance | Landed on feet | Full flip, stayed up |
+|---|---|---|
+| None | yes | yes (349°, torso upright at the end) |
+| ×0.5 | 40/40 | 35/40 |
+| ×1 (joints up to 0.03 rad off at the start, 5% command noise) | 39/40 | 28/40 |
+| ×2 | 32/40 | 11/40 |
+| ×4 | 19/40 | 3/40 |
+
+Without disturbance every run is the same, because the start and the policy are the same. That run
+also recovers from a 0.5 m/s shove forward or backward after landing, and stays up for 10 s.
+
+This is a simulation result, not ready for the real robot:
+
+- **Joint speed:** the knee reaches 1.6x the real motor's speed limit before touchdown, and 14 of the
+  401 control steps exceed a limit on some joint. Motor torque falls to zero at the limit, but the joint
+  can still be pushed past it by the rest of the moving leg, and the env only penalises that.
+- **Start:** it starts from a fixed crouch, placed there directly rather than reached from standing.
+- **Sim only:** it has perfect sensors (no noise), mirrored legs, flat ground and one friction value.
+- **Torque limits:** from the Berkeley team's Isaac Lab config. The torque-speed curve assumes Isaac
+  Lab's DC motor formula.
 
 ## Differences from the Playground task
 
 - Commands default to vx ∈ [0, 1], vy ∈ [-0.3, 0.3], yaw ∈ [-0.5, 0.5] m/s, rad/s (Playground: ±1 on all), and pushes are off by default. A narrower task learns in ~20M steps instead of ~150M.
+- On terrain, the velocity tracking reward uses sigma 0.25 instead of 0.5.
 - Episodes also end when the torso drops below 0.3 m. Only the feet collide with the floor in this model, so a fallen robot sinks through the ground.
